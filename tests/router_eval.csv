@@ -1,0 +1,31 @@
+question,intent
+What was that payment to the gym last month?,transaction_lookup
+What was that big shopping payment?,transaction_lookup
+Show me all my Uber rides in September,transaction_lookup
+When did I pay rent in October?,transaction_lookup
+Find the payment I made to Priya,transaction_lookup
+Which day did Netflix charge me in August?,transaction_lookup
+List my transactions above 5000 rupees,transaction_lookup
+What did I buy at Croma?,transaction_lookup
+Did I pay the electricity bill in September?,transaction_lookup
+Show the Swiggy orders from last week of October,transaction_lookup
+How much did I spend on food in October?,spending_analysis
+Compare my food spending in September and October,spending_analysis
+What are my top 5 merchants by spend?,spending_analysis
+What is my total spend for the whole statement?,spending_analysis
+Give me a category breakdown for August,spending_analysis
+How has my transport spending changed month to month?,spending_analysis
+What subscriptions do I pay for and how much per month?,spending_analysis
+What is my savings rate?,spending_analysis
+How much income did I get versus how much I spent?,spending_analysis
+What percentage of my spending went to rent?,spending_analysis
+Where am I overspending and how do I cut it?,savings_guidance
+How can I save more money on food delivery?,savings_guidance
+Is my shopping spend too high?,savings_guidance
+Give me tips to reduce my transport costs,savings_guidance
+Should I cancel some subscriptions?,savings_guidance
+How do I build an emergency fund from my current spending?,savings_guidance
+What budget should I set for eating out?,savings_guidance
+Thanks!,other
+What's the weather in Bangalore today?,other
+Tell me a joke,other

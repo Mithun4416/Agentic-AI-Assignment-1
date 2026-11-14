@@ -1,0 +1,15 @@
+# Secrets and real statements
+.env
+*.pdf
+uploads/
+real_statements/
+
+# Local data
+chroma_db/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.streamlit/secrets.toml
+pip_install.log
