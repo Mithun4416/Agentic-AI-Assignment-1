@@ -51,13 +51,215 @@
   }
 
   // ------------------------------------------------------------------ feedback
+  // ------------------------------------------------------------------ motion helpers
+  const reduceMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const afterPaint = (fn) => requestAnimationFrame(() => requestAnimationFrame(fn));  // style flush, then animate
+  const easeOutQuart = (x) => 1 - Math.pow(1 - x, 4);
+
+  // Show / hide with a CSS transition instead of an instant pop.
+  function showSoft(el) {
+    clearTimeout(el._hideTimer);
+    el.hidden = false;
+    afterPaint(() => el.classList.add("show"));
+  }
+  function hideSoft(el, ms = 460) {
+    el.classList.remove("show");
+    clearTimeout(el._hideTimer);
+    el._hideTimer = setTimeout(() => (el.hidden = true), reduceMotion() ? 0 : ms);
+  }
+  // Cross-fade a text change.
+  function swapText(el, text) {
+    if (reduceMotion()) { el.textContent = text; return; }
+    el.classList.add("swap");
+    setTimeout(() => { el.textContent = text; el.classList.remove("swap"); }, 230);
+  }
+  // Count a number up (or down) to its new value.
+  function countTo(el, to, fmt, from = 0, ms = 1000) {
+    cancelAnimationFrame(el._raf);
+    if (reduceMotion() || to == null || from == null || from === to) { el.textContent = to == null ? "—" : fmt(to); return; }
+    const t0 = performance.now();
+    const tick = (now) => {
+      const p = Math.min(1, (now - t0) / ms);
+      el.textContent = fmt(from + (to - from) * easeOutQuart(p));
+      if (p < 1) el._raf = requestAnimationFrame(tick);
+    };
+    el._raf = requestAnimationFrame(tick);
+  }
+  // Run fn once, the first time el is actually on screen (views start hidden, so this is when
+  // the user can see the animation, not when the data happened to arrive).
+  const visibleOnce = new IntersectionObserver((entries) => entries.forEach((e) => {
+    if (!e.isIntersecting) return;
+    visibleOnce.unobserve(e.target);
+    const fn = e.target._onVisible; e.target._onVisible = null;
+    fn && fn();
+  }), { threshold: 0.15 });
+  function whenVisible(el, fn) {
+    el._onVisible = fn;
+    visibleOnce.unobserve(el);
+    visibleOnce.observe(el);
+  }
+  // Fade-and-rise elements as they scroll into view, with a small stagger.
+  const revealer = new IntersectionObserver((entries) => entries.forEach((e) => {
+    if (!e.isIntersecting) return;
+    const el = e.target;
+    revealer.unobserve(el);
+    el.classList.add("in");
+    // Hand the element back to its own transitions (hover lift etc.) once the fade is done.
+    const done = () => { el.classList.remove("reveal", "in"); el.style.removeProperty("--i"); };
+    const delay = 700 + (parseInt(el.style.getPropertyValue("--i"), 10) || 0) * 70 + 120;
+    setTimeout(done, reduceMotion() ? 0 : delay);
+  }), { rootMargin: "0px 0px -6% 0px", threshold: 0.06 });
+  function reveal(nodes, { stagger = true } = {}) {
+    [...nodes].forEach((n, i) => {
+      n.classList.add("reveal");
+      n.style.setProperty("--i", stagger ? Math.min(i, 6) : 0);
+      revealer.observe(n);
+    });
+  }
+
+  // ------------------------------------------------------------------ tactile controls
+  // Sliding "glider" pill for tab groups. It stretches toward the destination first (leading edge
+  // races ahead), then the trailing edge catches up with a small springy overshoot.
+  function glide(container, target, { animate = true } = {}) {
+    if (!container) return;
+    let g = container.querySelector(":scope > .glider");
+    if (!g) {
+      g = document.createElement("span");
+      g.className = "glider";
+      g.setAttribute("aria-hidden", "true");
+      container.prepend(g);
+      animate = false;
+    }
+    if (!target) { g.style.opacity = "0"; g._pos = null; return; }
+    if (container.offsetParent === null) return;            // hidden view: position it when shown
+    const to = { x: target.offsetLeft, y: target.offsetTop, w: target.offsetWidth, h: target.offsetHeight };
+    const from = g._pos;
+    if (from && from.x === to.x && from.y === to.y && from.w === to.w && from.h === to.h) return;
+    g._pos = to;
+    g.style.opacity = "1";
+    const css = (p, w = p.w) => ({ transform: `translate3d(${p.x}px, ${p.y}px, 0)`, width: `${w}px`, height: `${p.h}px` });
+    g.getAnimations().forEach((a) => a.cancel());
+    Object.assign(g.style, css(to));
+    if (!animate || !from || from.y !== to.y || reduceMotion()) return;
+    // Mid-flight the leading edge is ~70% of the way there and the trailing edge ~22%: a clear
+    // stretch, without blanketing every label in between.
+    const dxL = to.x - from.x, dxR = (to.x + to.w) - (from.x + from.w);
+    const lead = 0.7, trail = 0.22;
+    const left = from.x + dxL * (dxL > 0 ? trail : lead);
+    const rightEdge = from.x + from.w + dxR * (dxR > 0 ? lead : trail);
+    const mid = { x: left, y: to.y, w: rightEdge - left, h: to.h };
+    const far = Math.abs(dxL) > to.w * 1.6;   // long jumps get a touch more time
+    g.animate([
+      { ...css(from), easing: "cubic-bezier(.5, 0, .5, 1)" },
+      { ...css(mid), offset: 0.4, easing: "cubic-bezier(.2, 1.35, .4, 1)" },
+      css(to),
+    ], { duration: far ? 600 : 520 });
+  }
+  function reglideAll() {
+    glide($(".tabs"), $(".tab[aria-current='page']"), { animate: false });
+    const seg = $("#periodSeg");
+    if (seg.children.length) glide(seg, $("button[aria-pressed='true']", seg), { animate: false });
+    $$(".trace[open] .trace-tabs").forEach((t) => glide(t, $("button[aria-selected='true']", t), { animate: false }));
+  }
+
+  // Ripple, burst and ring effects on every pressable control.
+  const PRESSABLE = ".btn, .tab, .chip, .seg button, .trace-tabs button, .fold > summary, .trace > summary";
+  const fxLayer = document.createElement("div");
+  fxLayer.className = "fx-layer";
+  fxLayer.setAttribute("aria-hidden", "true");
+  document.body.appendChild(fxLayer);
+
+  function ripple(el, x, y) {
+    const r = el.getBoundingClientRect();
+    const size = Math.hypot(Math.max(x - r.left, r.right - x), Math.max(y - r.top, r.bottom - y)) * 2;
+    const s = document.createElement("span");
+    s.className = "ripple";
+    Object.assign(s.style, { width: `${size}px`, height: `${size}px`, left: `${x - r.left}px`, top: `${y - r.top}px` });
+    el.appendChild(s);
+    s.animate([
+      { transform: "translate(-50%, -50%) scale(0)", opacity: 1 },
+      { transform: "translate(-50%, -50%) scale(1)", opacity: 1, offset: 0.55 },
+      { transform: "translate(-50%, -50%) scale(1.06)", opacity: 0 },
+    ], { duration: 720, easing: "cubic-bezier(.2, .7, .3, 1)" }).onfinish = () => s.remove();
+  }
+  function burst(x, y, colors, count = 14, spread = 1) {
+    for (let i = 0; i < count; i++) {
+      const b = document.createElement("i");
+      b.className = "fx-bit";
+      const size = 6 + Math.random() * 6;
+      Object.assign(b.style, {
+        width: `${size}px`, height: `${size}px`, background: colors[i % colors.length],
+        left: `${x}px`, top: `${y}px`, borderRadius: Math.random() < 0.3 ? "50%" : "1.5px",
+      });
+      fxLayer.appendChild(b);
+      const ang = (i / count) * Math.PI * 2 + Math.random() * 0.6;
+      const dist = (42 + Math.random() * 62) * spread;
+      const dx = Math.cos(ang) * dist, dy = Math.sin(ang) * dist;
+      const rot = (Math.random() - 0.5) * 600;
+      // phase 1: shoot out and decelerate (full size, full colour)
+      // phase 2: drift a little further and settle
+      // phase 3: fall slightly under "gravity" while shrinking and fading
+      b.animate([
+        { transform: "translate(-50%, -50%) translate(0, 0) rotate(0deg) scale(.4)", opacity: 1,
+          easing: "cubic-bezier(.12, .9, .25, 1)" },
+        { transform: `translate(-50%, -50%) translate(${dx * 0.85}px, ${dy * 0.85}px) rotate(${rot * 0.6}deg) scale(1.15)`, opacity: 1,
+          offset: 0.38, easing: "ease-out" },
+        { transform: `translate(-50%, -50%) translate(${dx}px, ${dy + 6}px) rotate(${rot * 0.8}deg) scale(1)`, opacity: 1,
+          offset: 0.62, easing: "cubic-bezier(.5, 0, .9, .6)" },
+        { transform: `translate(-50%, -50%) translate(${dx * 1.04}px, ${dy + 30}px) rotate(${rot}deg) scale(0)`, opacity: 0 },
+      ], { duration: 820 + Math.random() * 260 }).onfinish = () => b.remove();
+    }
+  }
+  function ring(x, y, color, size = 96) {
+    const r = document.createElement("i");
+    r.className = "fx-ring";
+    Object.assign(r.style, { width: `${size}px`, height: `${size}px`, left: `${x}px`, top: `${y}px`, borderColor: color });
+    fxLayer.appendChild(r);
+    r.animate([
+      { transform: "translate(-50%, -50%) scale(.12)", opacity: 1, borderWidth: "4px" },
+      { transform: "translate(-50%, -50%) scale(1)", opacity: 0, borderWidth: "1.5px" },
+    ], { duration: 600, easing: "cubic-bezier(.2, .8, .3, 1)" }).onfinish = () => r.remove();
+  }
+
+  // Saturated palette colours only: they read on the cream pages and on the dark hero alike.
+  const BURST_RED = ["#FF2800", "#9C6644", "#FF2800", "#7F5539", "#B08968", "#D62100"];
+  const BURST_WARM = ["#9C6644", "#7F5539", "#B08968", "#9C6644"];
+  document.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || reduceMotion()) return;
+    const el = e.target.closest(PRESSABLE);
+    if (el && !el.disabled) ripple(el, e.clientX, e.clientY);
+  }, { passive: true });
+  // Capture phase: runs before handlers that may re-render or remove the clicked element.
+  document.addEventListener("click", (e) => {
+    if (reduceMotion()) return;
+    const el = e.target.closest(PRESSABLE);
+    if (!el || el.disabled) return;
+    const r = el.getBoundingClientRect();
+    let x = e.clientX, y = e.clientY;
+    if (e.detail === 0) {                       // keyboard activation: effects from the centre
+      x = r.left + r.width / 2; y = r.top + r.height / 2;
+      ripple(el, x, y);
+    }
+    if (el.matches(".btn-red")) {
+      ring(x, y, "rgba(255, 40, 0, .95)", 150);
+      ring(x, y, "rgba(156, 102, 68, .85)", 90);    // inner echo ring
+      burst(x, y, BURST_RED, 22, 1.15);
+    } else if (el.matches(".chip")) {
+      ring(x, y, "rgba(156, 102, 68, .7)", 90);
+      burst(x, y, [...BURST_WARM, "#FF2800"], 12, 0.85);
+    } else if (el.matches(".btn")) {
+      ring(x, y, el.matches(".btn-dark") ? "rgba(127, 85, 57, .85)" : "rgba(156, 102, 68, .65)", 90);
+      burst(x, y, BURST_WARM, 9, 0.7);
+    }
+  }, true);
+
   let toastTimer;
   function toast(msg) {
     const t = $("#toast");
     t.textContent = msg;
-    t.hidden = false;
+    showSoft(t);
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => (t.hidden = true), 6500);
+    toastTimer = setTimeout(() => hideSoft(t), 6500);
   }
 
   let busyTimer;
@@ -66,12 +268,12 @@
     let i = 0;
     $("#busyStep").textContent = steps[0] || "";
     clearInterval(busyTimer);
-    if (steps.length > 1) busyTimer = setInterval(() => ($("#busyStep").textContent = steps[++i % steps.length]), 1700);
-    $("#busy").hidden = false;
+    if (steps.length > 1) busyTimer = setInterval(() => swapText($("#busyStep"), steps[++i % steps.length]), 1900);
+    showSoft($("#busy"));
   }
   function idle() {
     clearInterval(busyTimer);
-    $("#busy").hidden = true;
+    hideSoft($("#busy"), 340);
   }
 
   const tip = $("#tip");
@@ -98,8 +300,15 @@
       if (a.classList.contains("tab")) a.toggleAttribute("aria-current", a.dataset.nav === view);
       if (a.dataset.nav === view && a.classList.contains("tab")) a.setAttribute("aria-current", "page");
     });
+    glide($(".tabs"), $(".tab[aria-current='page']"));
+    if (view === "dashboard") afterPaint(() => {
+      const seg = $("#periodSeg");
+      if (seg.children.length) glide(seg, $("button[aria-pressed='true']", seg), { animate: false });
+    });
     if (location.hash.slice(1) !== view) history.replaceState(null, "", "#" + view);
-    window.scrollTo(0, 0);
+    window.scrollTo({ top: 0, behavior: "instant" });    // not the page's smooth scroll: we're changing pages
+    const el = $("#view-" + view);
+    if (!reduceMotion()) { el.classList.remove("entering"); void el.offsetWidth; el.classList.add("entering"); }
     onScroll();
     updateCta();
     if (view === "home") flow.start();
@@ -119,74 +328,130 @@
   }
 
   // ------------------------------------------------------------------ hero flow field (copper filaments)
+  // Streamlines are traced ONCE into Path2D objects and painted onto an offscreen "base" layer.
+  // Each frame only draws that cached layer plus light pulses gliding along ~70 strands (an animated
+  // lineDashOffset), so the per-frame cost is a few dozen stroke calls instead of tens of thousands of
+  // field evaluations. Time-based motion keeps the speed identical at 60, 120 or 144 Hz.
   const flow = (() => {
     const c = $("#flow");
-    const ctx = c.getContext("2d");
-    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const ctx = c.getContext("2d", { alpha: false });
+    const base = document.createElement("canvas");
+    const bctx = base.getContext("2d", { alpha: false });
+    const reduceMq = matchMedia("(prefers-reduced-motion: reduce)");
     const colors = ["#DDB892", "#B08968", "#E6CCB2", "#9C6644", "#DDB892", "#B08968"];
-    const STEP = 9;
-    let w = 0, h = 0, strands = [], raf = 0, t = 0;
+    const STEP = 6, MARGIN = 28;             // MARGIN: room for the parallax drift without showing edges
+    let w = 0, h = 0, dpr = 1, strands = [], pulses = [];
+    let raf = 0, last = 0, t = 0, onScreen = true;
+    let mx = 0, my = 0, px = 0, py = 0;    // pointer target and eased parallax (-1..1)
 
-    // Each strand is a streamline traced through a slowly drifting flow field, redrawn every frame
-    // (no fade trick, so no residue). Additive blending makes converging strands glow like a river.
-    const angle = (x, y) => {
+    const field = (x, y) => {
       const k = 0.0015;
-      return Math.PI * 0.4 + 1.05 * (Math.sin(x * k * 1.3 + t) + Math.cos(y * k * 1.9 - t * 0.7) + Math.sin((x + y) * k * 0.7 + t * 0.4));
+      return Math.PI * 0.4 + 1.05 * (Math.sin(x * k * 1.3) + Math.cos(y * k * 1.9) + Math.sin((x + y) * k * 0.7));
     };
-    function draw() {
+    const rand = (a, b) => a + Math.random() * (b - a);
+
+    function trace(x, y, steps) {
+      const p = new Path2D();
+      p.moveTo(x, y);
+      let len = 0;
+      for (let i = 0; i < steps; i++) {
+        const a = field(x, y);
+        x += Math.cos(a) * STEP; y += Math.sin(a) * STEP;
+        p.lineTo(x, y);
+        len += STEP;
+        if (x < -60 || x > w + 60 || y < -60 || y > h + 60) break;
+      }
+      return { path: p, len };
+    }
+
+    function build() {
+      dpr = Math.min(devicePixelRatio || 1, 1.75);
+      w = c.clientWidth; h = c.clientHeight;
+      if (!w || !h) return false;
+      c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+      const bw = w + MARGIN * 2, bh = h + MARGIN * 2;
+      base.width = Math.round(bw * dpr); base.height = Math.round(bh * dpr);
+
+      const n = Math.round(Math.max(120, Math.min(420, (w * h) / 3000)));
+      strands = Array.from({ length: n }, (_, i) => {
+        const bright = i % 8 === 0;
+        const { path, len } = trace(rand(-0.1, 1.1) * bw, rand(-0.25, 0.95) * bh, (rand(60, 230)) | 0);
+        return { path, len, c: colors[i % colors.length], bright,
+                 a: bright ? rand(0.28, 0.42) : rand(0.05, 0.17), lw: bright ? rand(1.1, 1.8) : rand(0.5, 1) };
+      });
+
+      // Cached base layer: background + every strand, faint.
+      bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      bctx.globalCompositeOperation = "source-over";
+      bctx.globalAlpha = 1;
+      bctx.fillStyle = "#22150D";
+      bctx.fillRect(0, 0, bw, bh);
+      bctx.globalCompositeOperation = "lighter";
+      bctx.lineCap = "round";
+      for (const s of strands) {
+        bctx.globalAlpha = s.a; bctx.lineWidth = s.lw; bctx.strokeStyle = s.c;
+        bctx.stroke(s.path);
+      }
+
+      // Light pulses travel along the longer strands, mostly the bright ones.
+      pulses = strands.filter((s) => s.len > 300 && (s.bright || Math.random() < 0.18)).slice(0, 72).map((s) => ({
+        s, dash: rand(70, 190), speed: rand(55, 150), phase: rand(0, s.len + 200),
+        a: s.bright ? rand(0.55, 0.85) : rand(0.3, 0.5), lw: s.lw + rand(0.3, 0.8),
+      }));
+      return true;
+    }
+
+    function draw(dt) {
+      t += dt / 1000;
+      const ease = 1 - Math.pow(0.0025, dt / 1000);        // frame-rate-independent easing
+      px += (mx - px) * ease; py += (my - py) * ease;
+      const ox = -MARGIN + px * MARGIN * 0.7, oy = -MARGIN + py * MARGIN * 0.5;
+
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.globalCompositeOperation = "source-over";
       ctx.globalAlpha = 1;
-      ctx.fillStyle = "#22150D";
-      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(base, Math.round(ox * dpr), Math.round(oy * dpr));
+
+      ctx.setTransform(dpr, 0, 0, dpr, ox * dpr, oy * dpr);
       ctx.globalCompositeOperation = "lighter";
       ctx.lineCap = "round";
-      for (const s of strands) {
-        let x = s.x, y = s.y;
-        ctx.beginPath();
-        ctx.moveTo(x, y);
-        for (let i = 0; i < s.len; i++) {
-          const a = angle(x, y);
-          x += Math.cos(a) * STEP; y += Math.sin(a) * STEP;
-          ctx.lineTo(x, y);
-          if (x < -40 || x > w + 40 || y > h + 40) break;
-        }
-        ctx.globalAlpha = s.a;
-        ctx.lineWidth = s.lw;
-        ctx.strokeStyle = s.c;
-        ctx.stroke();
+      for (const p of pulses) {
+        const period = p.dash + p.s.len;
+        ctx.setLineDash([p.dash, p.s.len]);
+        ctx.lineDashOffset = -((p.phase + t * p.speed) % period);
+        ctx.strokeStyle = p.s.c;
+        ctx.globalAlpha = p.a * 0.16; ctx.lineWidth = p.lw * 4.5;   // soft halo
+        ctx.stroke(p.s.path);
+        ctx.globalAlpha = p.a; ctx.lineWidth = p.lw;               // bright core
+        ctx.stroke(p.s.path);
       }
+      ctx.setLineDash([]);
     }
-    function loop() {
-      if (document.body.dataset.view !== "home" || document.hidden) { raf = 0; return; }
-      t += 0.0016;
-      draw();
-      raf = requestAnimationFrame(loop);
-    }
-    function resize() {
-      const dpr = Math.min(devicePixelRatio || 1, 2);
-      w = c.clientWidth; h = c.clientHeight;
-      if (!w || !h) return;
-      c.width = w * dpr; c.height = h * dpr;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      const n = Math.round(Math.max(110, Math.min(380, (w * h) / 3400)));
-      strands = Array.from({ length: n }, (_, i) => {
-        const bright = i % 9 === 0;   // a few strong strands, many fine ones
-        return {
-          x: Math.random() * w * 1.2 - w * 0.1, y: Math.random() * h * 1.1 - h * 0.25,
-          len: 50 + ((Math.random() * 150) | 0), c: colors[i % colors.length],
-          a: bright ? 0.5 + Math.random() * 0.3 : 0.07 + Math.random() * 0.2,
-          lw: bright ? 1.4 + Math.random() * 0.8 : 0.6 + Math.random() * 0.5,
-        };
-      });
-      draw();
+
+    const active = () => document.body.dataset.view === "home" && !document.hidden && onScreen && !reduceMq.matches;
+    function frame(now) {
+      if (!active()) { raf = 0; last = 0; return; }
+      const dt = last ? Math.min(now - last, 64) : 16.7;   // clamp so a background tab never "jumps"
+      last = now;
+      draw(dt);
+      raf = requestAnimationFrame(frame);
     }
     function start() {
-      if (!w) resize();
-      if (!reduce && !raf) raf = requestAnimationFrame(loop);
+      if (!w && !build()) return;
+      if (!raf) draw(0);
+      c.classList.add("ready");
+      if (active() && !raf) raf = requestAnimationFrame(frame);
     }
+
+    addEventListener("pointermove", (e) => {
+      mx = (e.clientX / innerWidth) * 2 - 1;
+      my = (e.clientY / innerHeight) * 2 - 1;
+    }, { passive: true });
+    new IntersectionObserver(([e]) => { onScreen = e.isIntersecting; start(); }).observe(c);
     let rt;
-    addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(resize, 150); });
+    addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { if (build()) start(); }, 150); });
     document.addEventListener("visibilitychange", start);
+    reduceMq.addEventListener?.("change", start);
     return { start };
   })();
 
@@ -269,39 +534,67 @@
   function renderDashboard() {
     const { metrics: m, breakdown, trend, flags, months } = dash;
 
-    $("#periodSeg").innerHTML = [["", "All months"], ...months.map((x) => [x, monthLabel(x)])]
-      .map(([v, l]) => `<button type="button" data-period="${esc(v)}" aria-pressed="${v === period}"><i class="dot"></i>${esc(l)}</button>`).join("");
+    // Period buttons are only rebuilt when the months change, so the glider can slide between them.
+    const seg = $("#periodSeg");
+    const opts = [["", "All months"], ...months.map((x) => [x, monthLabel(x)])];
+    const key = opts.map((o) => o[0]).join("|");
+    if (seg.dataset.key !== key) {
+      seg.dataset.key = key;
+      seg.innerHTML = opts.map(([v, l]) =>
+        `<button type="button" data-period="${esc(v)}" aria-pressed="false"><i class="dot"></i>${esc(l)}</button>`).join("");
+    }
+    $$("button[data-period]", seg).forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.period === period)));
+    glide(seg, $("button[aria-pressed='true']", seg));
 
+    // tiles: numbers count from their previous values (or from zero the first time)
     const rate = m.savings_rate_pct;
-    $("#tiles").innerHTML = [
-      ["Income", inr(m.income), m.other_credits ? `plus ${inr(m.other_credits)} other credits` : "salary and interest", ""],
-      ["Spend", inr(m.expense), m.invested ? `${inr(m.invested)} invested separately` : "excluding investments", ""],
-      ["Left over", inr(m.net_after_expense), "income minus spend", ""],
-      ["Savings rate", rate == null ? "—" : rate.toFixed(1) + "%", rate == null ? "no income in this period" : rate >= 20 ? "meets the 20% guideline" : "below the 20% guideline", "dark"],
-    ].map(([label, value, sub, cls]) =>
-      `<div class="tile ${cls}"><div class="tile-label">${label}</div><div class="tile-value" title="${esc(value)}">${esc(value)}</div><div class="tile-sub">${esc(sub)}</div></div>`).join("");
+    const pct = (v) => v.toFixed(1) + "%";
+    const tiles = [
+      ["Income", m.income, inr, m.other_credits ? `plus ${inr(m.other_credits)} other credits` : "salary and interest", ""],
+      ["Spend", m.expense, inr, m.invested ? `${inr(m.invested)} invested separately` : "excluding investments", ""],
+      ["Left over", m.net_after_expense, inr, "income minus spend", ""],
+      ["Savings rate", rate, pct, rate == null ? "no income in this period" : rate >= 20 ? "meets the 20% guideline" : "below the 20% guideline", "dark"],
+    ];
+    const tileBox = $("#tiles");
+    const firstTiles = !tileBox.children.length;
+    tileBox.innerHTML = tiles.map(([label, value, fmt, sub, cls]) =>
+      `<div class="tile ${cls}"><div class="tile-label">${label}</div><div class="tile-value" title="${esc(value == null ? "—" : fmt(value))}">${
+        firstTiles ? fmt(0) : esc(tileBox._last?.[label] == null ? "—" : fmt(tileBox._last[label]))}</div><div class="tile-sub">${esc(sub)}</div></div>`).join("");
+    const prev = tileBox._last || {};
+    tileBox._last = Object.fromEntries(tiles.map(([label, value]) => [label, value]));
+    const runCount = () => $$(".tile-value", tileBox).forEach((el, i) => {
+      const [label, value, fmt] = tiles[i];
+      countTo(el, value, fmt, firstTiles ? 0 : prev[label] ?? 0);
+    });
+    if (firstTiles) { reveal(tileBox.children); whenVisible(tileBox, runCount); } else runCount();
 
-    // categories: sorted horizontal bars, one hue (magnitude, not identity)
+    // categories: sorted horizontal bars, one hue (magnitude, not identity).
+    // Each bar starts at its previous width (or 0) and glides to the new one.
     const cats = breakdown.categories || [];
     const box = $("#catBars");
+    const prevW = box._w || {};
+    box._w = {};
     box.innerHTML = "";
     $("#catNote").textContent = cats.length ? `${inr(breakdown.total_spend)} total` : "";
     if (!cats.length) box.innerHTML = `<p class="chart-empty">No spending in this period.</p>`;
     const max = Math.max(...cats.map((c) => c.amount), 1);
-    cats.forEach((c) => {
+    cats.forEach((c, i) => {
+      const target = (c.amount / max * 100).toFixed(2) + "%";
+      box._w[c.category] = target;
       const row = document.createElement("div");
       row.className = "hbar";
       row.tabIndex = 0;
       row.setAttribute("role", "img");
       row.setAttribute("aria-label", `${c.category}: ${inr(c.amount)}, ${c.share_pct}% of spend, ${c.count} transactions`);
       row.innerHTML = `<span class="hbar-name">${esc(c.category)}</span>
-        <span class="hbar-track"><span class="hbar-fill" style="width:${(c.amount / max * 100).toFixed(2)}%;display:block"></span></span>
+        <span class="hbar-track"><span class="hbar-fill" data-w="${target}" style="width:${prevW[c.category] || "0%"};--i:${i}"></span></span>
         <span class="hbar-val">${inr(c.amount)}<span>${c.share_pct.toFixed(1)}%</span></span>`;
       bindTip(row, `<b>${esc(c.category)}</b><div class="tip-row"><span>Amount</span><span>${inr(c.amount)}</span></div>
         <div class="tip-row"><span>Share of spend</span><span>${c.share_pct.toFixed(1)}%</span></div>
         <div class="tip-row"><span>Transactions</span><span>${c.count}</span></div>`);
       box.appendChild(row);
     });
+    growWhenVisible(box);
 
     // monthly trend
     const allCats = [...new Set(trend.flatMap((t) => Object.keys(t.categories)))].sort();
@@ -316,22 +609,38 @@
         <span class="alert-tag"><i class="dot"></i>${f.severity === "warning" ? "Alert" : "Note"}</span>
         <div><h4>${esc(f.title)}</h4><p>${esc(f.detail)}</p></div>
       </article>`).join("") || `<p class="muted">Nothing unusual found.</p>`;
+    reveal($$("#alerts > .alert"));
 
     renderBudgets();
+  }
+
+  // Bars are rendered at their previous size (data-w / data-h hold the target); once the chart is on
+  // screen we flush styles and set the targets, so CSS transitions glide them into place.
+  function growWhenVisible(box) {
+    const grow = () => afterPaint(() => {
+      $$("[data-w]", box).forEach((f) => (f.style.width = f.dataset.w));
+      $$("[data-h]", box).forEach((f) => (f.style.height = f.dataset.h));
+    });
+    if (box.offsetParent !== null && box.getBoundingClientRect().top < innerHeight) grow();
+    else whenVisible(box, grow);
   }
 
   function renderTrend() {
     const box = $("#trendBars");
     const vals = dash.trend.map((t) => (trendCat ? t.categories[trendCat] || 0 : t.total));
     const max = Math.max(...vals, 1);
+    const prevH = box._h || {};
+    box._h = {};
     box.innerHTML = "";
     dash.trend.forEach((t, i) => {
+      const target = (vals[i] / max * 82).toFixed(2) + "%";
+      box._h[t.month] = target;
       const col = document.createElement("div");
       col.className = "vbar";
       col.tabIndex = 0;
       col.setAttribute("role", "img");
       col.setAttribute("aria-label", `${monthLabel(t.month)}: ${inr(vals[i])}`);
-      col.innerHTML = `<span class="vbar-val">${inr(vals[i])}</span><span class="vbar-fill" style="height:${(vals[i] / max * 82).toFixed(2)}%"></span>`;
+      col.innerHTML = `<span class="vbar-val">${inr(vals[i])}</span><span class="vbar-fill" data-h="${target}" style="height:${prevH[t.month] || "0%"};--i:${i}"></span>`;
       const prev = i ? vals[i - 1] : null;
       const change = prev ? ((vals[i] - prev) / prev * 100) : null;
       const top = Object.entries(t.categories).sort((a, b) => b[1] - a[1]).slice(0, 3);
@@ -348,6 +657,7 @@
       box.after(axis);
     }
     axis.innerHTML = dash.trend.map((t) => `<span>${esc(monthLabel(t.month))}</span>`).join("");
+    growWhenVisible(box);
   }
 
   function renderBudgets() {
@@ -552,12 +862,17 @@
     const stages = ["Rewriting the question", "Routing by intent", "Agent choosing tools", "Running pandas tools", "Checking every number"];
     let si = 0;
     const wait = addMsg("bot", `<div class="thinking"><span class="busy-bars"><i></i><i></i><i></i><i></i></span><span class="stage">${stages[0]}…</span></div>`);
-    const timer = setInterval(() => { si = Math.min(si + 1, stages.length - 1); $(".stage", wait).textContent = stages[si] + "…"; }, 1500);
+    const timer = setInterval(() => {
+      if (si >= stages.length - 1) return;
+      swapText($(".stage", wait), stages[++si] + "…");
+    }, 1600);
     wait.scrollIntoView({ block: "end", behavior: "smooth" });
     try {
       const { answer, trace } = await api("/api/chat", { json: { question: q } });
+      wait.classList.add("fresh");          // the answer's parts rise in, one after another
       wait.innerHTML = botHTML(answer, trace);
     } catch (e) {
+      wait.classList.add("fresh");
       wait.innerHTML = `<p class="warn-box">${esc(e.message)}</p>`;
     } finally {
       clearInterval(timer);
@@ -603,8 +918,11 @@
 
     $("#periodSeg").addEventListener("click", async (e) => {
       const b = e.target.closest("button[data-period]");
-      if (!b) return;
+      if (!b || b.dataset.period === period) return;
       period = b.dataset.period;
+      // move the selection immediately; numbers and bars follow when the data arrives
+      $$("button[data-period]", e.currentTarget).forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+      glide(e.currentTarget, b);
       try { await loadDashboard(); } catch (err) { toast(err.message); }
     });
     $("#trendCat").addEventListener("change", (e) => { trendCat = e.target.value; renderTrend(); });
@@ -655,12 +973,29 @@
       const trace = b.closest(".trace");
       $$(".trace-tabs button", trace).forEach((x) => x.setAttribute("aria-selected", x === b));
       $$(".trace-pane", trace).forEach((p) => (p.hidden = p.dataset.pane !== b.dataset.pane));
+      glide(b.parentElement, b);
     });
+    // place a trace's glider when it is first opened (it has no size while closed)
+    $("#thread").addEventListener("toggle", (e) => {
+      const d = e.target;
+      if (!d.matches?.("details.trace") || !d.open) return;
+      const tabs = $(".trace-tabs", d);
+      glide(tabs, $("button[aria-selected='true']", tabs), { animate: false });
+    }, true);
+    let gt;
+    addEventListener("resize", () => { clearTimeout(gt); gt = setTimeout(reglideAll, 120); });
+    document.fonts?.ready.then(reglideAll);
   }
 
   // ------------------------------------------------------------------ boot
   async function boot() {
     wire();
+    // static sections fade up as they scroll into view
+    reveal($$(".band .two-col > *"));
+    reveal($$(".steps .step"));
+    reveal($$(".model-block"));
+    reveal($$("#view-dashboard .grid-2 > .panel, #view-dashboard .block-head, #view-dashboard .fold"), { stagger: false });
+    reveal($$("#view-about .prose, #view-about .block-head, #view-about .table-wrap"), { stagger: false });
     go(location.hash.slice(1) || "home");
     try {
       state = await api("/api/state");
